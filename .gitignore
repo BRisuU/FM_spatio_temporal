@@ -1,0 +1,34 @@
+# Data (large files, not tracked)
+data/raw/
+data/processed/
+data/plots/
+data/correlation_plots/
+
+# Results (generated outputs)
+results/
+results_server/results.json
+results_server/predictions/
+results_server/trained_models/
+results_server/temp_results/
+results_server/loss_functions/
+results_server/results_analysis/
+results_server/results/
+
+# Cache
+cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store

@@ -1,0 +1,319 @@
+================================================================================
+FOUNDATION MODEL INTEGRATION REQUIREMENTS — FM_exo Framework
+================================================================================
+
+This document specifies every precondition a foundation model (FM) must satisfy
+to be fully compatible with the FM_exo architecture, including all learning
+paradigms (sequential, alternating) and all covariate configurations.
+
+
+────────────────────────────────────────────────────────────────────────────────
+1.  PYTHON CLASS INTERFACE
+────────────────────────────────────────────────────────────────────────────────
+
+The FM must be wrapped in a plain Python class (not nn.Module) that exposes
+exactly two public methods:
+
+    predict(x, horizon)   ->  torch.Tensor  shape (B, H, S)
+    encode_hidden(x, pool="mean")  ->  torch.Tensor  shape (B, D, S)
+
+where
+    B  = batch size
+    T  = input length (number of past time steps, e.g. 96)
+    H  = forecast horizon (number of future steps, e.g. 18)
+    S  = number of sensors / channels
+    D  = FM encoder hidden dimension (model-specific, must be a fixed integer)
+
+The class must also expose:
+    self.name    : str   — human-readable name used in log output
+    self.device  : torch.device
+
+Input convention for both methods:
+    x : torch.Tensor  shape (B, T, S)   dtype float32
+    The time axis is axis 1 (middle), sensors/channels are axis 2 (last).
+
+
+────────────────────────────────────────────────────────────────────────────────
+2.  predict() — DETAILED REQUIREMENTS
+────────────────────────────────────────────────────────────────────────────────
+
+Signature:
+    predict(self, x: Tensor[B,T,S], horizon: int) -> Tensor[B,H,S]
+
+2.1  Output shape
+    Must return exactly (B, H, S) — time-first within the prediction block.
+    Any internal format (e.g., (B,S,H)) must be transposed before returning.
+
+2.2  Device
+    Output must reside on self.device.  Input may arrive on any device;
+    the wrapper is responsible for moving it.
+
+2.3  Gradient flow (CRITICAL for Stage 1 / input-phase training)
+    • predict() must NOT be decorated with @torch.no_grad().
+    • The FM backbone parameters may have requires_grad=False (frozen),
+      but the output tensor MUST carry a grad_fn so that loss.backward()
+      propagates gradients back into the InputModule.
+    • Differentiability test:
+          out = fm.predict(x.requires_grad_(True), horizon)
+          assert out.requires_grad, "FM predict() is non-differentiable"
+    • A non-differentiable FM (e.g. Chronos-2, which uses discrete
+      tokenization via numpy) causes Stage 1 to silently produce no
+      gradient updates.  The framework detects this and skips Stage 1
+      with a warning, but Stage 1 then has NO effect on training.
+    • For a fully functional framework (all learning paradigms active),
+      the FM MUST be differentiable through predict().
+
+2.4  Frozen backbone pattern (recommended)
+    Freeze the transformer backbone; keep any task-specific head trainable:
+        for name, param in self.model.named_parameters():
+            if "head" not in name:
+                param.requires_grad_(False)
+    This lets Stage 1 and the alternating input phase fine-tune the head
+    jointly with InputModule without touching the large pretrained backbone.
+
+
+────────────────────────────────────────────────────────────────────────────────
+3.  encode_hidden() — DETAILED REQUIREMENTS
+────────────────────────────────────────────────────────────────────────────────
+
+Signature:
+    encode_hidden(self, x: Tensor[B,T,S], pool: str = "mean") -> Tensor[B,D,S]
+
+3.1  Output shape
+    Must return (B, D, S) where D is the hidden dimension of the FM encoder.
+    D must be a fixed integer known at construction time.
+
+3.2  Pooling
+    Must support pool="mean" (average over patch/token dimension).
+    pool="last" (last patch/token) is optional but recommended.
+
+3.3  Efficiency — hook pattern (strongly recommended)
+    In Stage 2 and FullModel forward passes, encode_hidden() is called
+    immediately after predict() on the same input x.  To avoid a second
+    FM forward pass (which doubles compute), cache the encoder output
+    during predict() via a forward hook:
+
+        self._last_enc_out = None
+        self._hook_handle = self.model.head.linear.register_forward_hook(
+            self._capture_enc_hook)
+
+        def _capture_enc_hook(self, module, inp, out):
+            self._last_enc_out = inp[0]   # tensor BEFORE the linear head
+
+    encode_hidden() then reads self._last_enc_out directly.
+    If called standalone (without a preceding predict()), it must trigger
+    a forward pass as a fallback.
+
+3.4  Hidden dimension D
+    D is used by PredictionModule to size its fm_adapter linear layer:
+        nn.Linear(fm_hidden_dim, hidden_dim)
+    The caller (main.py) sets fm_hidden_dim at construction time.
+    Known values:
+        Chronos-2     : D = 6144  (512-dim token embedding × 12 layers? — verify)
+        MOMENT-1-large: D = 1024  (T5-Large hidden size)
+    Register D in main.py:
+        if FM_MODEL == "moment":
+            fm_hidden_dim = 1024
+        else:   # chronos
+            fm_hidden_dim = 6144
+
+
+────────────────────────────────────────────────────────────────────────────────
+4.  INPUT FORMAT — PADDING & CONTEXT LENGTH
+────────────────────────────────────────────────────────────────────────────────
+
+The framework uses input_len=96 time steps.  If the FM requires a longer
+context window (e.g. MOMENT requires seq_len=512), the wrapper must handle
+padding internally:
+
+    - Right-align real data within a zero-padded tensor.
+    - Provide a binary input_mask  (1 = real data, 0 = padding) if the FM
+      supports it.  This prevents the FM from attending to padded positions.
+    - Padding must be done inside predict() and encode_hidden(); the rest of
+      the framework always passes raw (B, T, S) tensors.
+
+Example for MOMENT:
+    x_pad  = zeros(B, S, 512);  x_pad[:, :, -96:] = x.permute(0,2,1)
+    mask   = zeros(B, 512);     mask[:, -96:] = 1
+
+
+────────────────────────────────────────────────────────────────────────────────
+5.  FREEZING STRATEGY — WHAT TO FREEZE AND WHEN
+────────────────────────────────────────────────────────────────────────────────
+
+Stage 1 / Input phase  (trains InputModule):
+    Backbone        → frozen (requires_grad=False)
+    Forecasting head → MUST be in the Stage 1 optimizer if it is randomly
+                       initialized (see §6.1 below).  Otherwise InputModule
+                       trains against a random target and diverges.
+
+Stage 2 / Output phase  (trains PredictionModule):
+    Backbone        → frozen
+    Forecasting head → NOT in Stage 2 optimizer (already trained in Stage 1)
+    PredictionModule → trained
+
+The framework's Stage 2 optimizer covers only prediction_module.parameters().
+The FM's head parameters are not touched in Stage 2.
+
+
+────────────────────────────────────────────────────────────────────────────────
+6.  KNOWN PITFALLS AND HOW TO AVOID THEM
+────────────────────────────────────────────────────────────────────────────────
+
+6.1  Randomly-initialized forecasting head → Stage 1 divergence
+    Problem:  MOMENT's forecasting head is randomly initialized at load time
+              ("Only reconstruction head is pre-trained. Classification and
+              forecasting heads must be fine-tuned.").  If Stage 1 trains
+              InputModule to minimize loss through a random head, the loss
+              diverges (observed: 2.9 → 14.9 over 2 epochs).
+    Fix:      Add the head's parameters to the Stage 1 / input-phase optimizer
+              as a second parameter group, typically at a lower learning rate:
+                  stage1_param_groups = [
+                      {"params": list(input_module.parameters()), "lr": 3e-4},
+                      {"params": list(fm.model.head.parameters()), "lr": 1e-3},
+                  ]
+                  optimizer = torch.optim.AdamW(stage1_param_groups, weight_decay=0.01)
+
+6.2  Non-differentiable FM → Stage 1 is a no-op
+    Problem:  Chronos-2 uses pipeline.predict() which internally calls numpy
+              and produces tensors with no grad_fn.  loss.requires_grad is
+              False; loss.backward() crashes.
+    Handled:  The framework checks loss.requires_grad on the first batch and
+              skips all subsequent backward() calls with a warning.
+              Stage 1 completes in 0 seconds (no updates).
+    Implication: For Chronos-2 the learning paradigm collapses to Stage 2
+              only, making sequential ≡ alternating ≡ no-training for the
+              input phase.
+
+6.3  Shape mismatch when a covariate is absent at runtime
+    Problem:  If InputModule was initialized with use_event=True (so an
+              EventEncoder was created, contributing to cov_dim), but
+              event_X=None is passed at forward time, cov_dim shrinks and
+              AttentionFusion mat-mul crashes.
+    Fix:      Always supply a zero tensor when event_X is absent but the
+              encoder was initialized:
+                  if event_X is None:
+                      event_enc = torch.zeros(B, T, hidden_dim, device=device)
+              (already fixed in models/FM_spatial_preconditioned.py line 460)
+
+6.4  Import errors in foundation_models.py
+    Problem:  TimesFmModelForPrediction is not available in the installed
+              version of transformers.  A top-level import crashes the module.
+    Fix:      Move the import inside the method that uses it (lazy import):
+                  def init_timesfm(self):
+                      from transformers import TimesFmModelForPrediction
+                      ...
+              This way the module loads successfully; the error only appears
+              if TimesFMWrapper is actually instantiated.
+
+
+────────────────────────────────────────────────────────────────────────────────
+7.  LEARNING PARADIGMS — FM REQUIREMENTS SUMMARY
+────────────────────────────────────────────────────────────────────────────────
+
+SEQUENTIAL PARADIGM
+    Stage 1 (Input phase):
+        - Optimizer: InputModule params + FM head params (if randomly init'd)
+        - Gradient requirement: predict() must be differentiable
+        - Epochs: stage1_epochs (default 50, tests use 2)
+        - LR: 3e-4 for InputModule, 1e-3 for FM head
+        - Loss: MSE between fm_preds and y_true (normalized)
+
+    Stage 2 (Output phase):
+        - Optimizer: PredictionModule params only
+        - Gradient requirement: encode_hidden() output does NOT need grad
+          (PredictionModule is trained from the frozen hidden states)
+        - Epochs: stage2_epochs (default 100, tests use 2)
+        - LR: 3e-4
+
+ALTERNATING PARADIGM
+    Cycles (default 15 cycles × 5 epochs each phase):
+        Input phase:   same requirements as Stage 1 above
+        Output phase:  same requirements as Stage 2 above
+    The two phases alternate within each cycle.
+
+BOTH PARADIGMS require:
+    - FM backbone: frozen throughout
+    - FM head: co-trained with InputModule in input phase; frozen in output phase
+    - encode_hidden(): called every forward pass in Stage 2 / output phase
+      — must be efficient (use hook caching)
+
+
+────────────────────────────────────────────────────────────────────────────────
+8.  COVARIATE CONFIGURATIONS — WHAT THE FM MUST BE AGNOSTIC TO
+────────────────────────────────────────────────────────────────────────────────
+
+The FM wrapper receives only x (the raw or conditioned traffic tensor).
+It is completely agnostic to which covariate configuration is active.
+The six configurations differ only in what InputModule and PredictionModule do:
+
+    no_cov          : x passed to FM unchanged; PredictionModule has no encoders
+    past_date_only  : x conditioned by date before FM; no future covariates
+    future_date_only: x unchanged; PredictionModule fuses future date
+    date_both       : x conditioned by past date; PredictionModule fuses future date
+    weather_both    : x conditioned by past weather; PredictionModule fuses future weather
+    all_cov         : all past covariates condition x; all future covariates fused in PM
+
+The FM wrapper interface (predict, encode_hidden) is identical in all cases.
+
+
+────────────────────────────────────────────────────────────────────────────────
+9.  COVARIATE TENSOR FORMATS (for reference)
+────────────────────────────────────────────────────────────────────────────────
+
+These tensors are processed by InputModule and PredictionModule, NOT by the FM.
+They are listed here so a new FM integration can be tested in the correct context.
+
+    date_X   : (B, T, 3)    — past  calendar features [hour/23, dow/6, month/11]
+    date_Y   : (B, H, 3)    — future calendar features
+    weather_X: (B, T, W)    — past  weather   (W = number of weather variables)
+    weather_Y: (B, H, W)    — future weather
+    event_X  : (B, T, E)    — past  event indicators  (E = event categories)
+    event_Y  : (B, H, E)    — future event indicators
+    y_mask   : (B, H, S)    — optional validity mask (0 = sensor offline)
+
+All covariate values are normalized to [0, 1] or similar bounded range.
+
+
+────────────────────────────────────────────────────────────────────────────────
+10.  CHECKLIST FOR INTEGRATING A NEW FM
+────────────────────────────────────────────────────────────────────────────────
+
+[ ] 1. Create a wrapper class with self.name, self.device, predict(), encode_hidden()
+[ ] 2. predict() returns (B, H, S) on self.device, no @torch.no_grad()
+[ ] 3. encode_hidden() returns (B, D, S); D is a known fixed integer
+[ ] 4. Determine D and set fm_hidden_dim in main.py FM instantiation block
+[ ] 5. If FM context window ≠ input_len=96, add padding logic inside the wrapper
+[ ] 6. Freeze backbone parameters; keep task head trainable
+[ ] 7. Check: does loss.requires_grad = True after predict()? If not, Stage 1 is a no-op
+[ ] 8. If task head is randomly initialized, add it to the Stage 1 optimizer
+       (param group with lr=3e-4 for InputModule, lr=1e-3 for head)
+[ ] 9. Register a forward hook on the linear layer before output to cache encoder states
+[ ] 10. Add the new FM to the FM_MODEL conditional block in main.py (~line 1636)
+[ ] 11. If FM lives on CPU (e.g. Chronos), ensure .to(self.device) at output of predict()
+[ ] 12. Run the smoke test: shapes, requires_grad, and backprop OK
+[ ] 13. Run with paradigm=sequential, config=past_date_only: Stage 1 loss must DECREASE
+
+
+────────────────────────────────────────────────────────────────────────────────
+IMPLEMENTED MODELS
+────────────────────────────────────────────────────────────────────────────────
+
+Chronos-2  (amazon/chronos-2)
+    Class:           models/FM_spatial_preconditioned.py :: Chronos2
+    D (hidden dim):  6144
+    Differentiable:  NO  — uses discrete tokenization via numpy pipeline
+    Stage 1 effect:  None (framework detects and skips backward)
+    Padding needed:  No  — pipeline handles variable-length inputs
+    Note:            Stage 1 / input phase is architecturally inert for Chronos-2.
+
+MOMENT-1-large  (AutonLab/MOMENT-1-large)
+    Class:           models/FM_spatial_preconditioned.py :: MomentWrapper
+    D (hidden dim):  1024  (T5-Large)
+    Differentiable:  YES — continuous patch embeddings, grad flows through head
+    Stage 1 effect:  Active — InputModule + head trained jointly
+    Padding needed:  YES — right-align 96 steps into 512-step context window
+    Head init:       Random at load time → must be in Stage 1 optimizer
+    Hook target:     self.model.head.linear  (captures (B, S, 64×1024))
+    Observed Stage 1 loss (2 epochs): 0.1866 → 0.0960  (converging)
+================================================================================

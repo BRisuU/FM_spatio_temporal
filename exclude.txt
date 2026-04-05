@@ -1,0 +1,20 @@
+// files to exclude from uploading to the server
+
+data/correlation_plots
+data/plots
+data/processed
+data/raw
+
+results/
+.git/*
+.venv/lib/*
+results_server/predictions/*
+results_server/results/*
+results_server/temp_results/*
+results_server/trained_models/*
+results_server/fl_sensors
+results_server/results.json
+results_server/results_analysis
+results_server/loss_functions
+results_server/results.json
+timesfm/
